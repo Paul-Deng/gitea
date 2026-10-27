@@ -400,31 +400,24 @@ func RunnerBulkActionPost(ctx *context.Context) {
 		return
 	}
 
-	runners, err := db.Find[actions_model.ActionRunner](ctx, &actions_model.FindRunnerOptions{IDs: runnerIDs})
+	runners, err := db.Find[actions_model.ActionRunner](ctx, &actions_model.FindRunnerOptions{IDs: runnerIDs, Sort: "oldest"})
 	if err != nil {
 		ctx.ServerError("FindRunners", err)
 		return
 	}
 
-	err = db.WithTx(ctx, func(txCtx stdctx.Context) error {
-		for _, r := range runners {
-			switch action {
-			case "delete":
+	if action == "delete" {
+		err = db.WithTx(ctx, func(txCtx stdctx.Context) error {
+			for _, r := range runners {
 				if err := actions_model.DeleteRunner(txCtx, r.ID); err != nil {
 					return err
 				}
-			case "disable":
-				if err := actions_model.SetRunnerDisabled(txCtx, r, true); err != nil {
-					return err
-				}
-			case "enable":
-				if err := actions_model.SetRunnerDisabled(txCtx, r, false); err != nil {
-					return err
-				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	} else {
+		err = actions_model.SetRunnersDisabled(ctx, runners, action == "disable")
+	}
 	if err != nil {
 		log.Warn("RunnerBulkActionPost.%s failed: %v, url: %s", action, err, ctx.Req.URL)
 		ctx.Flash.Error(ctx.Tr(failedKey))

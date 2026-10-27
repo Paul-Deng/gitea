@@ -4,6 +4,7 @@
 package actions
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -343,18 +344,67 @@ func UpdateRunner(ctx context.Context, r *ActionRunner, cols ...string) error {
 	return err
 }
 
-func SetRunnerDisabled(ctx context.Context, runner *ActionRunner, isDisabled bool) error {
-	if runner.IsDisabled == isDisabled {
-		return nil
-	}
-
-	return db.WithTx(ctx, func(ctx context.Context) error {
-		runner.IsDisabled = isDisabled
-		if err := UpdateRunner(ctx, runner, "is_disabled"); err != nil {
-			return err
+// getRunnerForUpdate serializes assignment and maintenance until the enclosing transaction ends.
+func getRunnerForUpdate(ctx context.Context, id int64) (*ActionRunner, error) {
+	e := db.GetEngine(ctx).Context(ctx)
+	var runner ActionRunner
+	var has bool
+	var err error
+	if setting.Database.Type.IsMySQL() || setting.Database.Type.IsPostgreSQL() {
+		has, err = e.ID(id).ForUpdate().Get(&runner)
+	} else {
+		// SQLite and MSSQL do not support XORM's FOR UPDATE clause.
+		if _, err := e.Exec("UPDATE action_runner SET is_disabled = is_disabled WHERE id = ?", id); err != nil {
+			return nil, err
 		}
-		return IncreaseTaskVersion(ctx, runner.OwnerID, runner.RepoID)
+		has, err = e.ID(id).Get(&runner)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !has {
+		return nil, fmt.Errorf("runner with id %d: %w", id, util.ErrNotExist)
+	}
+	return &runner, nil
+}
+
+func SetRunnerDisabled(ctx context.Context, runner *ActionRunner, isDisabled bool) error {
+	return SetRunnersDisabled(ctx, []*ActionRunner{runner}, isDisabled)
+}
+
+// SetRunnersDisabled locks every runner before updating shared task versions.
+func SetRunnersDisabled(ctx context.Context, runners []*ActionRunner, isDisabled bool) error {
+	ordered := slices.Clone(runners)
+	slices.SortFunc(ordered, func(a, b *ActionRunner) int { return cmp.Compare(a.ID, b.ID) })
+	err := db.WithTx(ctx, func(ctx context.Context) error {
+		locked := make([]*ActionRunner, len(ordered))
+		for i, runner := range ordered {
+			fresh, err := getRunnerForUpdate(ctx, runner.ID)
+			if err != nil {
+				return err
+			}
+			locked[i] = fresh
+		}
+		for _, fresh := range locked {
+			if fresh.IsDisabled == isDisabled {
+				continue
+			}
+			fresh.IsDisabled = isDisabled
+			if err := UpdateRunner(ctx, fresh, "is_disabled"); err != nil {
+				return err
+			}
+			if err := IncreaseTaskVersion(ctx, fresh.OwnerID, fresh.RepoID); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+	if err == nil {
+		for _, runner := range runners {
+			runner.IsDisabled = isDisabled
+		}
+	}
+	return err
 }
 
 // DeleteRunner deletes a runner by given ID.

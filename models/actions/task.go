@@ -252,6 +252,10 @@ func makeTaskStepDisplayName(step *jobparser.Step, limit int) (name string) {
 // another runner won the optimistic-lock race; it is never returned to callers.
 var errJobAlreadyClaimed = errors.New("job already claimed by another runner")
 
+var errRunnerDisabled = errors.New("runner is disabled")
+
+var errRunnerAlreadyUsed = errors.New("ephemeral runner already has a task")
+
 // pickTaskBatchSize bounds how many waiting jobs each CreateTaskForRunner query loads,
 // so a large backlog is not fetched into memory on every runner poll.
 // It is a var only so tests can shrink it to exercise pagination cheaply.
@@ -304,6 +308,9 @@ func CreateTaskForRunner(ctx context.Context, runner *ActionRunner) (*ActionTask
 				continue
 			}
 			task, ok, err := claimJobForRunner(ctx, runner, v)
+			if errors.Is(err, errRunnerDisabled) || errors.Is(err, errRunnerAlreadyUsed) {
+				return nil, false, nil
+			}
 			if err != nil {
 				return nil, false, err
 			}
@@ -331,6 +338,28 @@ func claimJobForRunner(ctx context.Context, runner *ActionRunner, job *ActionRun
 
 	err := db.WithTx(ctx, func(ctx context.Context) error {
 		e := db.GetEngine(ctx)
+		freshRunner, err := getRunnerForUpdate(ctx, runner.ID)
+		if err != nil {
+			return err
+		}
+		if freshRunner.IsDisabled {
+			return errRunnerDisabled
+		}
+		if freshRunner.Ephemeral {
+			var hasTask bool
+			if setting.Database.Type.IsMSSQL() {
+				// Do not wait for task reports which may already be waiting for this runner.
+				hasTask, err = e.SQL("SELECT TOP (1) 1 FROM action_task WITH (NOWAIT) WHERE runner_id = ?", freshRunner.ID).Exist()
+			} else {
+				hasTask, err = e.Where("runner_id = ?", freshRunner.ID).Exist(new(ActionTask))
+			}
+			if err != nil {
+				return err
+			}
+			if hasTask {
+				return errRunnerAlreadyUsed
+			}
+		}
 
 		if err := job.LoadAttributes(ctx); err != nil {
 			return err
@@ -450,10 +479,10 @@ func UpdateTask(ctx context.Context, task *ActionTask, cols ...string) error {
 	if len(cols) > 0 {
 		sess.Cols(cols...)
 	}
-	_, err := sess.Update(task)
+	affected, err := sess.Update(task)
 
-	// Automatically delete the ephemeral runner if the task is done
-	if err == nil && task.Status.IsDone() && util.SliceContainsString(cols, "status") {
+	// A released task must not retire a runner reused by a later claim.
+	if err == nil && affected > 0 && task.Status.IsDone() && util.SliceContainsString(cols, "status") {
 		return DeleteEphemeralRunner(ctx, task.RunnerID)
 	}
 	return err

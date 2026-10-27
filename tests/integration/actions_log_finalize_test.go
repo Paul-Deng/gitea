@@ -55,6 +55,9 @@ jobs:
 		createWorkflowFile(t, token, user2.Name, repo.Name, wfTreePath, getWorkflowCreateFileOptions(user2, repo.DefaultBranch, "trigger", wfFileContent))
 
 		task := runner.fetchTask(t)
+		allocated := unittest.AssertExistsAndLoadBean(t, &actions_model.ActionTask{ID: task.Id})
+		registered := unittest.AssertExistsAndLoadBean(t, &actions_model.ActionRunner{ID: allocated.RunnerID})
+		require.NoError(t, actions_model.SetRunnerDisabled(t.Context(), registered, true))
 
 		resp, err := runner.client.runnerServiceClient.UpdateLog(t.Context(), connect.NewRequest(&runnerv1.UpdateLogRequest{
 			TaskId: task.Id,
@@ -73,6 +76,8 @@ jobs:
 
 		_, err = dbfs.Open(t.Context(), actions_module.DBFSPrefix+freshTask.LogFilename)
 		assert.ErrorIs(t, err, os.ErrNotExist, "DBFS row must be cleaned up after TransferLogs")
+		runner.execTask(t, task, &mockTaskOutcome{result: runnerv1.Result_RESULT_SUCCESS})
+		unittest.AssertExistsAndLoadBean(t, &actions_model.ActionTask{ID: task.Id, Status: actions_model.StatusSuccess})
 
 		// The runner re-sends its final UpdateLog when the response was lost.
 		// A sealed log must ack the re-send and still reject new appended rows.
